@@ -55,6 +55,17 @@ def _encode_stream_event(type: str, **payload) -> str:
     """编码一条 NDJSON 流式事件。"""
     return json.dumps({"type": type, **payload}, ensure_ascii=False) + "\n"
 
+def _is_data_inspection_error(error: Exception) -> bool:
+    """识别上游模型内容安全检查失败。"""
+    text = str(error).lower()
+    return "data_inspection_failed" in text or "datainspectionfailed" in text
+
+def _data_inspection_error_message() -> str:
+    return (
+        "上游模型拒绝处理当前输入，通常是入库文本触发了模型服务的内容安全检查。"
+        "可以尝试缩小提问范围、只问具体片段，或切换内容安全策略不同的模型服务。"
+    )
+
 def _route_label(route: str) -> str:
     return {
         "direct": "直接回答",
@@ -751,6 +762,8 @@ async def ask_question(request: ChatRequest, db: AsyncSession = Depends(get_db))
     except HTTPException: raise
     except Exception as e:
         logger.error(f"问答失败: {e}")
+        if _is_data_inspection_error(e):
+            raise HTTPException(status_code=422, detail=_data_inspection_error_message())
         raise HTTPException(status_code=500, detail=f"问答失败: {str(e)}")
 
 @router.post("/ask/stream")
@@ -810,6 +823,9 @@ async def ask_question_stream(request: ChatRequest):
             yield _encode_stream_event("done")
         except Exception as e:
             logger.error(f"流式问答失败: {e}")
+            if _is_data_inspection_error(e):
+                yield _encode_stream_event("error", message=_data_inspection_error_message())
+                return
             yield _encode_stream_event("error", message=f"问答失败: {e}")
 
     return StreamingResponse(

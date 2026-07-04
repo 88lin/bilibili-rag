@@ -60,17 +60,17 @@ class ContentFetcher:
             VideoContent 对象
         """
         ensure_not_cancelled(self.cancel_check)
-        # 获取视频基本信息
+        # 获取视频基本信息。即使调用方传了 cid，也需要读取 pages 来识别多 P 视频。
         video_info = None
-        if not cid or not title:
-            try:
-                video_info = await self.bili.get_video_info(bvid)
-                ensure_not_cancelled(self.cancel_check)
-                if not cid:
-                    cid = video_info.get("cid")
-                if not title:
-                    title = video_info.get("title", "未知标题")
-            except Exception as e:
+        try:
+            video_info = await self.bili.get_video_info(bvid)
+            ensure_not_cancelled(self.cancel_check)
+            if not cid:
+                cid = video_info.get("cid")
+            if not title:
+                title = video_info.get("title", "未知标题")
+        except Exception as e:
+            if not cid or not title:
                 logger.error(f"获取视频信息失败 [{bvid}]: {e}")
                 return VideoContent(
                     bvid=bvid,
@@ -82,6 +82,7 @@ class ContentFetcher:
                     owner_mid=owner_mid,
                     duration=duration,
                 )
+            logger.warning(f"获取视频信息失败 [{bvid}]，将按单 P 处理: {e}")
         
         owner = (video_info.get("owner") or {}) if video_info else {}
         description = description or (video_info.get("desc", "") if video_info else "")
@@ -92,7 +93,12 @@ class ContentFetcher:
         # Level 1: 跳过 AI 摘要，优先使用 ASR
         logger.info(f"[{bvid}] 已跳过 AI 摘要，优先使用 ASR")
 
-        asr_text = await self._try_asr(bvid, cid)
+        pages = self._extract_video_pages(video_info, cid)
+        if len(pages) > 1:
+            asr_text = await self._try_multi_part_asr(bvid, pages)
+        else:
+            asr_cid = pages[0]["cid"] if pages else cid
+            asr_text = await self._try_asr(bvid, asr_cid)
         ensure_not_cancelled(self.cancel_check)
         if asr_text:
             logger.info(f"[{bvid}] 使用 ASR 文本")
@@ -134,6 +140,38 @@ class ContentFetcher:
             owner_mid=owner_mid,
             duration=duration,
         )
+
+    def _extract_video_pages(self, video_info: Optional[dict], fallback_cid: Optional[int]) -> list[dict]:
+        """从视频详情中提取分 P 信息。"""
+        pages = []
+        for index, page in enumerate((video_info or {}).get("pages") or [], start=1):
+            page_cid = page.get("cid")
+            if not page_cid:
+                continue
+            pages.append({
+                "cid": page_cid,
+                "page": page.get("page") or index,
+                "part": page.get("part") or f"P{index}",
+            })
+        if pages:
+            return pages
+        return [{"cid": fallback_cid, "page": 1, "part": "P1"}] if fallback_cid else []
+
+    async def _try_multi_part_asr(self, bvid: str, pages: list[dict]) -> Optional[str]:
+        """逐个分 P 转写并合并文本。"""
+        logger.info(f"[{bvid}] 检测到多 P 视频，共 {len(pages)} P，开始逐 P ASR")
+        parts = []
+        for page in pages:
+            ensure_not_cancelled(self.cancel_check)
+            page_no = page["page"]
+            part_title = page["part"]
+            text = await self._try_asr(bvid, page["cid"])
+            ensure_not_cancelled(self.cancel_check)
+            if text:
+                parts.append(f"## P{page_no} {part_title}\n\n{text}")
+            else:
+                logger.warning(f"[{bvid}] P{page_no} ASR 未获取到有效文本")
+        return "\n\n".join(parts).strip() or None
 
     async def _try_asr(self, bvid: str, cid: int) -> Optional[str]:
         """尝试进行音频转写"""

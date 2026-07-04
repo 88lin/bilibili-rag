@@ -47,6 +47,12 @@ class ChatStreamHelperTest(unittest.TestCase):
         self.assertLessEqual(len(event["preview"]), 223)
         self.assertEqual(event["url"], "https://www.bilibili.com/video/BV1")
 
+    def test_data_inspection_error_is_user_facing(self):
+        error = Exception("InternalError.Algo.DataInspectionFailed: data_inspection_failed")
+
+        self.assertTrue(chat._is_data_inspection_error(error))
+        self.assertIn("内容安全检查", chat._data_inspection_error_message())
+
 
 class PrepareMessagesProgressTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
