@@ -256,13 +256,13 @@ A：B 站音频直链存在鉴权/过期/区域限制，只有公网可直接拉
 
 ---
 
-> 免责声明：本项目仅供个人学习与技术研究，使用者需自行遵守相关平台协议与法律法规，禁止用于未授权的商业或违规用途。
+> 免责声明：本项目采用 PolyForm Noncommercial License 1.0.0，仅授权非商业用途。使用者仍需自行遵守相关平台协议与法律法规；本软件不授予 B 站视频、音频、字幕或其他第三方内容的任何权利。
 
 ---
 
 ## 📜 License
 
-MIT
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
 
 ---
 
