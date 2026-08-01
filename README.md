@@ -277,6 +277,6 @@ A：B 站音频直链存在鉴权/过期/区域限制，只有公网可直接拉
 
 如果这个项目对你有帮助，欢迎自愿支持后续维护：
 
-![支付宝支持项目](docs/alipay-support.jpg)
+<img src="docs/alipay-support.jpg" alt="支付宝支持项目" width="280">
 
 支持完全自愿，不影响项目免费使用。
