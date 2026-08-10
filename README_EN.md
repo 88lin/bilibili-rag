@@ -310,4 +310,4 @@ This project is released under the [Apache License 2.0](LICENSE).
 
 ## Disclaimer
 
-This project is for personal learning and technical research. Users are responsible for complying with platform terms, copyright rules, and applicable laws. Do not use it for unauthorized commercial or illegal purposes.
+Users are responsible for complying with platform terms, copyright rules, and applicable laws. This project does not grant any rights to Bilibili videos, audio, subtitles, or other third-party content.
