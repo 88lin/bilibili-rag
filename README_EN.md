@@ -306,7 +306,7 @@ bilibili-rag/
 
 ## License
 
-This project is released under the MIT License. See [LICENSE](LICENSE).
+This project is released under the [Apache License 2.0](LICENSE).
 
 ## Disclaimer
 
