@@ -273,8 +273,11 @@ async def _ingest_single_video(
             FavoriteVideo.bvid == bvid,
         )
     )
-    if relation is None:
-        db.add(FavoriteVideo(folder_id=folder.id, bvid=bvid, is_selected=True))
+
+    # 先提交元数据，ASR 和向量处理期间不持有 SQLite 写锁；收藏关系仍在
+    # 处理成功或失败后写入，取消操作不会留下已入库关系。
+    ensure_not_cancelled(cancel_check)
+    await db.commit()
 
     try:
         ensure_not_cancelled(cancel_check)
@@ -307,6 +310,8 @@ async def _ingest_single_video(
                 raise RuntimeError("未生成可写入的向量文档")
             _set_cache_processing_result(cache)
 
+        if relation is None:
+            db.add(FavoriteVideo(folder_id=folder.id, bvid=bvid, is_selected=True))
         folder.last_sync_at = datetime.utcnow()
         ensure_not_cancelled(cancel_check)
         await db.commit()
@@ -316,6 +321,8 @@ async def _ingest_single_video(
         raise
     except Exception as e:
         _set_cache_processing_result(cache, e)
+        if relation is None:
+            db.add(FavoriteVideo(folder_id=folder.id, bvid=bvid, is_selected=True))
         await db.commit()
         raise
 
@@ -411,6 +418,9 @@ async def _sync_folder(
     for bvid, meta in video_map.items():
         await _upsert_video_cache(db, bvid, meta)
 
+    # 收藏夹和视频元数据先落库，避免在 ASR/向量处理期间长期占用 SQLite 写锁。
+    await db.commit()
+
     source_priority = {
         ContentSource.BASIC_INFO.value: 1,
         ContentSource.AI_SUMMARY.value: 2,
@@ -449,8 +459,6 @@ async def _sync_folder(
         cache = result.scalar_one_or_none()
         has_vectors = rag.has_video(bvid)
         vector_presence[bvid] = has_vectors
-        if cache and cache.is_processed and not has_vectors:
-            _set_cache_processing_result(cache, RuntimeError("向量数据缺失，等待重新入库"))
         if _should_refresh_cache(cache) or cache is None or not cache.is_processed or not has_vectors:
             update_candidates.add(bvid)
 
@@ -478,6 +486,9 @@ async def _sync_folder(
             has_vectors = vector_presence.get(bvid)
             if has_vectors is None:
                 has_vectors = rag.has_video(bvid)
+
+            # 释放上面的只读事务，外部 ASR/向量调用期间不持有 SQLite 锁。
+            await db.commit()
 
             needs_fetch = _should_refresh_cache(cache)
             content = None
@@ -575,6 +586,9 @@ async def _sync_folder(
                 progress_callback(meta["title"], processed_targets, total_targets)
         except Exception as e:
             logger.error(f"写入数据库失败 [{bvid}]: {e}")
+
+        # 每个视频单独提交，缩短锁持有时间，也保留已经完成的处理进度。
+        await db.commit()
 
     # 删除无效向量
     if removed:
@@ -805,10 +819,31 @@ async def build_knowledge_base(
     if not session:
         raise HTTPException(status_code=401, detail="未登录或会话已过期")
 
+    request_key = (
+        tuple(sorted(set(request.folder_ids))),
+        tuple(sorted(set(request.exclude_bvids or []))),
+    )
+    for existing_task_id, task in build_tasks.items():
+        if (
+            task.get("session_id") == session_id
+            and task.get("status") in {"pending", "running"}
+        ):
+            if task.get("request_key") == request_key:
+                return {
+                    "task_id": existing_task_id,
+                    "message": "相同构建任务正在进行",
+                }
+            raise HTTPException(
+                status_code=409,
+                detail="已有其他构建任务正在进行，请等待完成后重试",
+            )
+
     import uuid
     task_id = str(uuid.uuid4())
 
     build_tasks[task_id] = {
+        "session_id": session_id,
+        "request_key": request_key,
         "status": "pending",
         "progress": 0,
         "current_step": "初始化中...",

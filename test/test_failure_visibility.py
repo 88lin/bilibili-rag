@@ -1,13 +1,31 @@
 import unittest
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import AsyncMock, Mock, patch
 
+from fastapi import BackgroundTasks, HTTPException
 from langchain.schema import Document
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
-from app.models import Base, ContentSource, FavoriteFolder, FavoriteVideo, VideoCache, VideoContent
-from app.routers.knowledge import _set_cache_processing_result, _sync_folder, get_folder_status
+from app.models import (
+    Base,
+    ContentSource,
+    FavoriteFolder,
+    FavoriteVideo,
+    UserSession,
+    VideoCache,
+    VideoContent,
+)
+from app.routers.knowledge import (
+    BuildRequest,
+    _set_cache_processing_result,
+    _sync_folder,
+    build_knowledge_base,
+    build_tasks,
+    get_folder_status,
+)
 from app.services.rag import RAGService
 
 
@@ -77,6 +95,111 @@ class FailureVisibilityTest(unittest.TestCase):
 
 
 class SyncFailureVisibilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_duplicate_build_request_reuses_active_task(self):
+        build_tasks.clear()
+        first_background_tasks = BackgroundTasks()
+        second_background_tasks = BackgroundTasks()
+        try:
+            with patch(
+                "app.routers.knowledge.get_session",
+                new=AsyncMock(return_value={"cookies": {}}),
+            ):
+                first = await build_knowledge_base(
+                    BuildRequest(folder_ids=[1]),
+                    first_background_tasks,
+                    session_id="session",
+                )
+                second = await build_knowledge_base(
+                    BuildRequest(folder_ids=[1]),
+                    second_background_tasks,
+                    session_id="session",
+                )
+        finally:
+            build_tasks.clear()
+
+        self.assertEqual(first["task_id"], second["task_id"])
+        self.assertEqual(len(first_background_tasks.tasks), 1)
+        self.assertEqual(len(second_background_tasks.tasks), 0)
+
+    async def test_different_build_request_is_rejected_while_task_is_active(self):
+        build_tasks.clear()
+        first_background_tasks = BackgroundTasks()
+        try:
+            with patch(
+                "app.routers.knowledge.get_session",
+                new=AsyncMock(return_value={"cookies": {}}),
+            ):
+                await build_knowledge_base(
+                    BuildRequest(folder_ids=[1], exclude_bvids=["BV1"]),
+                    first_background_tasks,
+                    session_id="session",
+                )
+                with self.assertRaises(HTTPException) as error:
+                    await build_knowledge_base(
+                        BuildRequest(folder_ids=[2]),
+                        BackgroundTasks(),
+                        session_id="session",
+                    )
+        finally:
+            build_tasks.clear()
+
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertIn("构建任务", error.exception.detail)
+
+    async def test_sync_releases_sqlite_write_lock_before_fetching_content(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "sync.db"
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{database_path}",
+                connect_args={"timeout": 0.05},
+            )
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+            concurrent_write_completed = False
+
+            async def fetch_content(*args, **kwargs):
+                nonlocal concurrent_write_completed
+                async with session_factory() as concurrent_db:
+                    concurrent_db.add(UserSession(session_id="concurrent-session"))
+                    await concurrent_db.commit()
+                concurrent_write_completed = True
+                return VideoContent(
+                    bvid="BV1",
+                    title="video",
+                    content="有效字幕内容" * 20,
+                    source=ContentSource.ASR,
+                )
+
+            async with session_factory() as db:
+                bili = Mock()
+                bili.get_favorite_content = AsyncMock(
+                    return_value={"info": {"title": "folder", "media_count": 1}}
+                )
+                bili.get_all_favorite_videos = AsyncMock(
+                    return_value=[{"bvid": "BV1", "title": "video", "cid": 1}]
+                )
+                content_fetcher = Mock()
+                content_fetcher.fetch_content = AsyncMock(side_effect=fetch_content)
+                rag = Mock()
+                rag.has_video.return_value = False
+                rag.add_video_content.return_value = 1
+
+                result = await _sync_folder(
+                    db,
+                    bili,
+                    rag,
+                    content_fetcher,
+                    session_id="session",
+                    folder_id=1,
+                )
+
+            await engine.dispose()
+
+        self.assertTrue(concurrent_write_completed)
+        self.assertEqual(result["failed"], 0)
+
     async def test_vector_failure_is_recorded_and_not_counted_as_indexed(self):
         engine = create_async_engine("sqlite+aiosqlite:///:memory:")
         async with engine.begin() as connection:

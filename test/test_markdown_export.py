@@ -1,5 +1,7 @@
 import unittest
 from datetime import datetime
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import HTTPException
@@ -230,6 +232,56 @@ class MarkdownExportEndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(relations), ["BV1"])
         content_fetcher.fetch_content.assert_awaited_once()
         rag.add_video_content.assert_called_once()
+
+    async def test_single_video_ingest_releases_sqlite_lock_before_content_fetch(self):
+        with TemporaryDirectory() as temp_dir:
+            database_path = Path(temp_dir) / "single-video.db"
+            engine = create_async_engine(
+                f"sqlite+aiosqlite:///{database_path}",
+                connect_args={"timeout": 0.05},
+            )
+            async with engine.begin() as connection:
+                await connection.run_sync(Base.metadata.create_all)
+            session_factory = async_sessionmaker(engine, expire_on_commit=False)
+
+            async def fetch_content(*_args, **_kwargs):
+                async with session_factory() as concurrent_db:
+                    concurrent_db.add(UserSession(session_id="concurrent-session"))
+                    await concurrent_db.commit()
+                return VideoContent(
+                    bvid="BV1",
+                    title="目标视频",
+                    content="有效字幕内容" * 20,
+                    source=ContentSource.ASR,
+                )
+
+            bili = Mock()
+            bili.get_favorite_content = AsyncMock(
+                return_value={"info": {"title": "folder", "media_count": 1}}
+            )
+            bili.get_all_favorite_videos = AsyncMock(
+                return_value=[{"bvid": "BV1", "title": "目标视频", "cid": 1}]
+            )
+            content_fetcher = Mock()
+            content_fetcher.fetch_content = AsyncMock(side_effect=fetch_content)
+            rag = Mock()
+            rag.has_video.return_value = False
+            rag.add_video_content.return_value = 1
+
+            async with session_factory() as db:
+                cache = await _ingest_single_video(
+                    db,
+                    bili,
+                    rag,
+                    content_fetcher,
+                    "session",
+                    1,
+                    "BV1",
+                )
+
+            await engine.dispose()
+
+        self.assertTrue(cache.is_processed)
 
     async def test_single_video_ingest_cancellation_rolls_back_before_vector_write(self):
         async with self.session_factory() as db:
